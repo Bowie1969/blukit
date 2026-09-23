@@ -1,0 +1,26 @@
+{
+  "name": "blukit",
+  "displayName": "BluKit",
+  "base": "dark",
+  "colors": {
+    "primary": "#3E7BFA",
+    "accent": "#6FA8FF",
+    "text": "#E0E6F0",
+    "textStrong": "#F4F8FF",
+    "textDim": "#8D9BB5",
+    "textMuted": "#5C6880",
+    "border": "#2E3A57",
+    "borderFocus": "#3D7DFF",
+    "success": "#3FD68C",
+    "warning": "#FFB224",
+    "error": "#FF5147",
+    "diffAdded": "#3FB68B",
+    "diffRemoved": "#F2555A",
+    "diffAddedStrong": "#7BE0B5",
+    "diffRemovedStrong": "#FF9A8F",
+    "diffGutter": "#66748A",
+    "diffMeta": "#8FB0D8",
+    "roleUser": "#6BA6FF",
+    "shellMode": "#4D8DFF"
+  }
+}

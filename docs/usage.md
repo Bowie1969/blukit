@@ -1,0 +1,941 @@
+# blukit usage
+
+This page goes past the quick start in the [README](../README.md): how the scope is collected and
+written, what each flag does in practice, and a set of worked sessions you can copy from.
+
+- [Red/blue symmetry](#redblue-symmetry)
+- [The launch sequence](#the-launch-sequence)
+- [Worked example: preparing an engagement](#worked-example-preparing-an-engagement)
+- [Worked example: scripted and CI runs](#worked-example-scripted-and-ci-runs)
+- [Worked example: several projects on one machine](#worked-example-several-projects-on-one-machine)
+- [Worked example: deviating from a project's scope](#worked-example-deviating-from-a-projects-scope)
+- [Worked example: inspecting and changing the recorded scope](#worked-example-inspecting-and-changing-the-recorded-scope)
+- [Worked example: reading the launch log](#worked-example-reading-the-launch-log)
+- [Worked example: watching the scope during a session](#worked-example-watching-the-scope-during-a-session)
+- [Worked example: the theme and the doctor command](#worked-example-the-theme-and-the-doctor-command)
+- [Scope syntax reference](#scope-syntax-reference)
+- [What gets written to `.mcp.json`](#what-gets-written-to-mcpjson)
+- [Recipes](#recipes)
+- [Troubleshooting](#troubleshooting)
+
+## Red/blue symmetry
+
+blukit is the blue-team mirror of **evilkit**. The two are the same product shape — a scope-gated
+launcher that records an authorised target set into a project's `.mcp.json`, keeps a timestamped
+backup on every atomic write, logs each launch, and refuses to run when the scope cannot be
+recorded — pointed at opposite ends of the same fight. evilkit launches the red CLI against a
+`pentest` tool server; blukit launches the blue CLI against a `defense` tool server. Everything that
+makes evilkit safe to hand an offensive agent is exactly what makes blukit safe to hand a defensive
+one.
+
+| Concern                    | evilkit (red)                              | blukit (blue)                                   |
+| -------------------------- | ------------------------------------------ | ----------------------------------------------- |
+| Launches                   | Kimi Code CLI                              | Claude Code CLI                                  |
+| MCP server it scopes       | `mcpServers.pentest`                       | `mcpServers.defense`                            |
+| Tool surface behind it     | offensive: probe/exploit an authorised target | defensive: read-only telemetry queries + scope-gated response actions |
+| Scope env var (allow)      | `PENTEST_ALLOWED_TARGETS`                  | `DEFENSE_ALLOWED_TARGETS`                       |
+| Scope env var (deny)       | `PENTEST_DENIED_TARGETS`                   | `DEFENSE_DENIED_TARGETS`                        |
+| Launch log                 | `~/.local/state/evilkit/launches.jsonl`    | `~/.local/state/blukit/launches.jsonl`         |
+| Theme / config / bin envs  | `EVILKIT_*`, `evilkit` theme               | `BLUKIT_*`, `blukit` theme                      |
+| Model on the command line  | passthrough as-is; CLI may default         | **must be pinned** (`-- --model opus`); never defaults |
+
+The scope means the same thing on both sides: the set of hosts, IPs and CIDRs the launched agent's
+tool server is authorised to act on. For evilkit that is what may be attacked; for blukit that is
+which assets may be queried for telemetry and, where the server allows it, acted on with a response.
+The normalisation, the atomic timestamped-backup write, the fail-closed behaviour when there is no
+server to scope, the deny list that wins over the allow list, and the `watch` pane that alarms if the
+recorded scope changes mid-session are all identical.
+
+The one deliberate asymmetry is the **model pin**. evilkit hands whatever follows `--` to the Kimi
+Code CLI and lets it choose a model. blukit refuses to launch unless the arguments after `--` name a
+model explicitly — `-- --model opus` or `-- --model sonnet` — and it refuses *first*, before the scope is
+collected, recorded or logged, so a run with no model writes nothing and launches nothing. A blue
+session should never start on an ambient default model that nobody chose, so blukit makes the choice
+mandatory and per-launch.
+
+## The launch sequence
+
+`blukit run` does this, in order. A rejected scope, a scope that cannot be recorded, or a missing
+binary stops it.
+
+**Before any of it, a real launch checks that a model was pinned.** Everything after `--` is passed
+straight to the Claude Code CLI; unless those arguments name a model (`-- --model opus`, `-- --model
+sonnet`, or `-- --model=opus`), the run is refused with `exit 2` before the scope is even collected —
+nothing is written and nothing is launched. This is the guardrail that keeps a blue session from ever
+inheriting an ambient default model. A `--dry-run` launches nothing, so it is exempt: it previews the
+scope mechanics without demanding a model.
+
+1. Report any config problems as `blukit: ...` warnings on stderr, then carry on using the default
+   for each bad key.
+2. Collect the scope: `--scope`, then a non-empty `DEFENSE_ALLOWED_TARGETS` in the environment, then
+   the configured `default_scope` when `-y` was passed or stdin is not a TTY, then an interactive
+   prompt.
+3. Normalise it. A rejected value prints two lines to stderr and exits `2` without touching
+   anything.
+4. Resolve where the scope goes: the path from `--mcp-json`, or the nearest `.mcp.json` at or above
+   the working directory.
+5. Unless `--no-write` was passed or `write_mcp_json` is `false`, record the scope in
+   `mcpServers.defense.env.DEFENSE_ALLOWED_TARGETS`, and the `--deny` list in
+   `mcpServers.defense.env.DEFENSE_DENIED_TARGETS` when that flag was given. This is the step that
+   fails closed: if there is no file, no `defense` server in it, or the write itself fails, the run
+   stops with `exit 1` and the CLI is never started.
+6. Resolve the Claude Code CLI binary. If it is not found, exit `1`.
+7. Unless `--no-audit` was passed or `audit` is `false`, append one entry to the local launch log,
+   naming the scope and whether it was enforced. A log that cannot be written is a warning on stderr
+   and nothing else; the launch carries on.
+8. Print `blukit: authorized scope -> <scope>`, flush stdout and stderr, and `exec` the CLI,
+   replacing the blukit process. Its exit status becomes the session's exit status, and no blukit
+   code runs afterwards.
+
+Because step 8 is an `exec`, the Claude Code CLI is the process you Ctrl-C out of. blukit does not run
+alongside it, does not read its output, and does not clean up after it. The flush in that step is why
+the status lines survive when stdout is a pipe or a log file rather than a terminal.
+
+Step 8 prints `authorized scope -> <scope>` only when that scope is in force: recorded in the file, or
+deliberately left unwritten because you asked for that with `--no-write` or
+`write_mcp_json = false`. When `--allow-unscoped` lets a run continue after a failed step 5, the line
+is different — `scope -> <scope> (NOT enforced; recorded scope is unchanged)` — and the session runs
+under whatever scope the file already held.
+
+With `--dry-run`, steps 4 and 5 run against the same target and report the same failures and the same
+exit codes, and the write is replaced by a description of what it would have done. The run ends
+before step 7, so a dry run is never logged. Adding `--no-write` as well takes a shortcut instead:
+the run stops after step 3, checks no target, and launches nothing.
+
+The environment handed to the CLI is your environment, plus `DEFENSE_ALLOWED_TARGETS` set to the
+normalised scope, plus `CLAUDE_CODE_IDENTITY_NAME` and `CLAUDE_CODE_IDENTITY_SLUG` set to `blukit`
+unless they were already set, plus everything in `[extra_env]` from your config. The scope is applied
+last, so no `[extra_env]` entry can override it. A deny list is not added to that environment: it is
+written to the file, which is the copy the tool server reads, and omitting `--deny` leaves it alone.
+
+`--deny` is the other half of the boundary. It records `DEFENSE_DENIED_TARGETS` from the same
+comma-separated syntax `--scope` takes — ranges, hostnames and IPv6 included — and the tool server
+checks that list first, so a deny entry wins over an allow entry. It is how "all of `10.20.30.0/24`
+except `10.20.30.7`" is expressed:
+
+```console
+$ blukit -s 10.20.30.0/24 --deny 10.20.30.7 -n
+blukit: would record 10.20.30.0/24 in /srv/engagements/acme/.mcp.json [deny: 10.20.30.7/32]
+blukit: would launch /home/you/.claude/bin/claude
+```
+
+Omitting `--deny` leaves the recorded deny list exactly as it was, so a bare re-scope never blanks
+one. An empty `--deny` records "deny nothing" — the empty value is not the `solo` loopback alias,
+because those aliases describe an *allow* scope, where "nothing" means "lock down to loopback".
+Both lists are validated before either is written, so a deny entry that does not parse leaves the
+file untouched and exits `2`.
+
+## Worked example: preparing an engagement
+
+A project directory needs a `defense` MCP server before blukit can do anything useful. The shape it
+expects is in `examples/.mcp.json.example`:
+
+```json
+{
+  "mcpServers": {
+    "defense": {
+      "command": "python3",
+      "args": ["tools_server.py"],
+      "env": {
+        "DEFENSE_ALLOWED_TARGETS": "127.0.0.1/32",
+        "DEFENSE_DENIED_TARGETS": "",
+        "DEFENSE_ALLOW_PIVOT": "0",
+        "DEFENSE_ALLOW_INTERPRETER": "0",
+        "DEFENSE_ALLOW_ANY_CMD": "0",
+        "DEFENSE_TOKEN": ""
+      }
+    }
+  }
+}
+```
+
+Copy it into your engagement directory, then check the wiring before you launch:
+
+```console
+$ cd /srv/engagements/acme
+$ cp /path/to/blukit/examples/.mcp.json.example .mcp.json
+$ blukit doctor
+claude binary        : /home/you/.claude/bin/claude ok
+config file        : /home/you/.config/blukit/config.toml absent (defaults)
+mcp.json           : /srv/engagements/acme/.mcp.json
+recorded scope     : 127.0.0.1/32
+theme installed    : yes (/home/you/.claude/themes)
+audit log          : /home/you/.local/state/blukit/launches.jsonl (nothing recorded yet)
+```
+
+Now launch with the range you are authorised to test. `-n` first if you want to see the plan:
+
+```console
+$ blukit -s 10.20.30.0/24,10.20.40.0/24 -n
+blukit: would record 10.20.30.0/24,10.20.40.0/24 in /srv/engagements/acme/.mcp.json
+blukit: would launch /home/you/.claude/bin/claude
+$ blukit -s 10.20.30.0/24,10.20.40.0/24
+blukit: scope 10.20.30.0/24,10.20.40.0/24 recorded in /srv/engagements/acme/.mcp.json
+blukit: authorized scope -> 10.20.30.0/24,10.20.40.0/24
+```
+
+The dry run decides against the same file the real run would use, so it is a genuine preflight for
+the ways the scope can fail to be recorded, and it exits non-zero exactly where a real run would
+refuse to start. A target with nothing to scope fails the same way a real run does, unless you allow
+the unscoped launch:
+
+```console
+$ blukit -s 10.0.0.0/24 -n
+blukit: /srv/engagements/globex/.mcp.json declares no 'defense' server; nothing to scope
+blukit: nothing was launched: the scope could not be recorded
+blukit: pass --allow-unscoped to launch anyway, knowing the scope may differ
+$ echo $?
+1
+$ blukit -s 10.0.0.0/24 -n --allow-unscoped
+blukit: /srv/engagements/globex/.mcp.json declares no 'defense' server; nothing to scope — launching with the scope NOT recorded
+blukit: the enforced scope may differ from the one requested; check .mcp.json before trusting it
+blukit: would not record 10.0.0.0/24 (unscoped launch allowed)
+blukit: would launch /home/you/.claude/bin/claude
+```
+
+When the file already holds the scope you asked for, the dry run says so rather than describing a
+write:
+
+```console
+$ blukit -s 10.20.30.0/24,10.20.40.0/24 -n
+blukit: would leave /srv/engagements/acme/.mcp.json at 10.20.30.0/24,10.20.40.0/24
+blukit: would launch /home/you/.claude/bin/claude
+```
+
+What it cannot check is whether the directory can be written to, because only a real run creates the
+staging file and takes the lock.
+
+Two networks, one `DEFENSE_ALLOWED_TARGETS` value, comma-separated. The `.mcp.json` now holds:
+
+```json
+{
+  "mcpServers": {
+    "defense": {
+      "command": "python3",
+      "args": ["tools_server.py"],
+      "env": {
+        "DEFENSE_ALLOWED_TARGETS": "10.20.30.0/24,10.20.40.0/24",
+        "DEFENSE_DENIED_TARGETS": "",
+        "DEFENSE_ALLOW_PIVOT": "0",
+        "DEFENSE_ALLOW_INTERPRETER": "0",
+        "DEFENSE_ALLOW_ANY_CMD": "0",
+        "DEFENSE_TOKEN": ""
+      }
+    }
+  }
+}
+```
+
+and the previous version is beside it as `.mcp.json.<YYYYmmdd-HHMMSS>.bak`.
+
+Because resolution walks upward from the working directory, you do not have to launch from the
+project root:
+
+```console
+$ cd /srv/engagements/acme/recon/nmap
+$ blukit -s 10.20.30.0/24 -n
+blukit: would record 10.20.30.0/24 in /srv/engagements/acme/.mcp.json
+blukit: would launch /home/you/.claude/bin/claude
+```
+
+Pass CLI arguments through after `--`. blukit does not parse or validate them; they are handed to
+the Claude Code CLI unchanged, so use that CLI's own flags (`--model` for a model, `-c` to continue the
+previous session, `-p` for a one-shot prompt):
+
+```console
+$ blukit -s 10.20.30.0/24 -- --model claude-k2 -c
+$ blukit -s 10.20.30.0/24 -- -p "list the targets you can reach"
+```
+
+## Worked example: scripted and CI runs
+
+Prompts are the enemy of a scripted run, so the non-interactive path is worth knowing precisely.
+With no `--scope`:
+
+- `-y` skips the prompt and uses `default_scope`.
+- A non-TTY stdin (`< /dev/null`, a pipe, a cron job, a CI step) also skips the prompt and uses
+  `default_scope`, even without `-y`.
+- An empty `DEFENSE_ALLOWED_TARGETS` in the environment does not count as a scope, so it falls
+  through to the same default.
+
+```console
+$ blukit -y -n
+blukit: would record 127.0.0.1/32 in /srv/engagements/acme/.mcp.json
+blukit: would launch /home/you/.claude/bin/claude
+
+$ blukit -n < /dev/null
+blukit: would record 127.0.0.1/32 in /srv/engagements/acme/.mcp.json
+blukit: would launch /home/you/.claude/bin/claude
+```
+
+Note what the fallback is: the locked-down loopback scope, not the range from last time. A scripted
+run that forgets its scope lands on `127.0.0.1/32` rather than silently reusing an old one.
+
+A batch step does not need any extra flag to be safe: an unrecordable scope is fatal on its own, so
+`set -e` stops the batch. Dropping `--strict` from an older script changes nothing, because the flag
+is deprecated and inert.
+
+```bash
+set -euo pipefail
+cd /srv/engagements/acme
+BLUKIT_CLAUDE_BIN=/bin/true blukit -s 10.20.30.0/24 -y
+```
+
+Pointing `BLUKIT_CLAUDE_BIN` at a command that exists and exits immediately — `/bin/true` on Linux,
+`/usr/bin/true` on macOS — satisfies the binary check and ends the run as soon as the scope has been
+recorded, with no interactive session.
+
+Be careful with `--allow-unscoped` here. It is the one flag that makes the batch continue after a
+failure to record the scope, with the session running under whatever the file already held. A
+pipeline that must not do that should leave it off and treat any non-zero exit as fatal.
+
+For a scheduled re-scope with no launch at all, the same trick is the whole recipe:
+
+```bash
+BLUKIT_CLAUDE_BIN=/bin/true \
+  blukit -s 10.20.30.0/24 -y   # record the scope, no interactive session
+blukit scope show              # verify
+```
+
+Exit code `2` means the scope was rejected by the parser; exit code `1` means it was accepted but
+could not be recorded. Both mean the run did not launch, and both are worth failing on:
+
+```bash
+if ! BLUKIT_CLAUDE_BIN=/bin/true blukit -s "$SCOPE" -y; then
+  echo "blukit could not scope this project to $SCOPE" >&2
+  exit 1
+fi
+```
+
+### Output from a scripted run
+
+Status lines go to stdout and warnings to stderr, and both streams are flushed immediately before
+blukit replaces itself with the Claude Code CLI, so a run under a pipe, a redirect or a CI step logs
+the same lines a terminal shows:
+
+```console
+$ blukit -s 10.20.30.0/24 > run.log 2>/dev/null
+$ cat run.log
+blukit: scope already 10.20.30.0/24 in /srv/engagements/acme/.mcp.json
+blukit: authorized scope -> 10.20.30.0/24
+<whatever the Claude Code CLI writes to stdout>
+```
+
+The child process's own output follows, because from that point the CLI has inherited the same
+streams. If you want the scope as data rather than as log text, read it back with
+`blukit scope show`, whose first line is the value from the file — a second `deny:` line follows
+only when a deny list is recorded.
+
+## Worked example: several projects on one machine
+
+The nearest `.mcp.json` wins, so one machine can hold several engagements with different scopes and
+they do not collide:
+
+```text
+/srv/engagements/acme/.mcp.json          -> DEFENSE_ALLOWED_TARGETS = 10.20.30.0/24
+/srv/engagements/globex/.mcp.json        -> DEFENSE_ALLOWED_TARGETS = 192.0.2.0/24
+/srv/engagements/globex/recon/.mcp.json  -> DEFENSE_ALLOWED_TARGETS = 198.51.100.7/32
+```
+
+From `/srv/engagements/globex/recon`, blukit writes to the nested file, not the one above it. That
+is the correct behaviour if the nested file is a deliberate narrowing, and a surprise if it is a
+stale copy someone left behind. `blukit scope show` prints the scope of whichever file blukit
+would write, so it is the cheap way to check:
+
+```console
+$ cd /srv/engagements/globex/recon
+$ blukit scope show
+198.51.100.7/32
+```
+
+To target a specific file regardless of where you are:
+
+```console
+$ blukit -s 192.0.2.0/24 --mcp-json /srv/engagements/globex/.mcp.json
+blukit: scope 192.0.2.0/24 recorded in /srv/engagements/globex/.mcp.json
+blukit: authorized scope -> 192.0.2.0/24
+```
+
+`--mcp-json` pointing at a file that does not exist is a fatal error, not a create:
+
+```console
+$ blukit -s 192.0.2.0/24 --mcp-json /srv/engagements/globex/.mcp.json.typo
+blukit: /srv/engagements/globex/.mcp.json.typo does not exist
+$ echo $?
+1
+```
+
+## Worked example: deviating from a project's scope
+
+Two reasons to launch without rewriting the file.
+
+### The file already holds the scope you want
+
+The writer is a no-op when the value matches, so you can launch repeatedly without churning backups:
+
+```console
+$ blukit -s 10.20.30.0/24
+blukit: scope already 10.20.30.0/24 in /srv/engagements/acme/.mcp.json
+blukit: authorized scope -> 10.20.30.0/24
+```
+
+### You want the file left alone entirely
+
+`--no-write` (same as `--read-only`) exports the environment and writes nothing:
+
+```console
+$ blukit -s 10.20.30.9 --no-write
+blukit: scope -> 10.20.30.9/32 (not written; --no-write)
+blukit: authorized scope -> 10.20.30.9/32
+```
+
+Understand what that does and does not do. blukit exports `DEFENSE_ALLOWED_TARGETS`, but the `env`
+block inside `.mcp.json` is injected into the MCP child process and takes precedence over the parent
+environment — that precedence is the reason blukit writes the file at all. So with `--no-write`,
+any MCP server started from that file keeps the scope the file already had. `--no-write` is for
+situations where the file is already correct, or where your tool server reads the process
+environment rather than the file.
+
+This is the one case where the `authorized scope -> <scope>` banner appears without the file having
+been touched, because not writing was your instruction rather than a failure. Everything the banner
+says about the exported environment holds; it says nothing about the scope recorded in the file,
+which `--no-write` left alone. If you need those two to agree, drop `--no-write` and let blukit
+record the scope, or check the file yourself with `blukit scope show`.
+
+The same switch is available as a setting, for a project where you never want the file touched:
+
+```toml
+# ~/.config/blukit/config.toml
+write_mcp_json = false
+```
+
+## Worked example: inspecting and changing the recorded scope
+
+```console
+$ blukit scope show
+10.20.30.0/24,10.20.40.0/24
+
+$ blukit scope add 10.20.50.0/24
+blukit: scope 10.20.30.0/24,10.20.40.0/24,10.20.50.0/24 recorded in /srv/engagements/acme/.mcp.json
+
+$ blukit scope remove 10.20.40.0/24
+blukit: scope 10.20.30.0/24,10.20.50.0/24 recorded in /srv/engagements/acme/.mcp.json
+
+$ blukit scope set 10.20.30.0/24,app.internal
+blukit: scope 10.20.30.0/24,app.internal recorded in /srv/engagements/acme/.mcp.json
+```
+
+`scope set` replaces the record; `add` and `remove` fold a target list into it. All three write
+through the same validated, atomic, backed-up path the launcher uses, and all three take `--dry-run`
+to report the change without writing it:
+
+```console
+$ blukit scope set solo --dry-run
+blukit: would record 127.0.0.1/32 in /srv/engagements/acme/.mcp.json
+```
+
+A scope changes mid-engagement — a host is added once the client confirms it, or dropped when it is
+decommissioned — and these are how you change it without also starting a session. `run` writes the
+scope it is about to enforce; these commands are for when you want the record changed and nothing
+launched.
+
+`remove` subtracts *entries*, not address space: removing `10.20.40.5/32` from a record that holds
+`10.20.40.0/24` leaves the `/24` in place, so that host is still authorised. Remove the wider entry,
+or `scope set` the exact list you mean. Removing the last remaining target is refused outright, so an
+empty scope is never written by accident — use `scope clear` when that is what you want.
+
+`scope clear` writes the loopback default; it does not delete the key or the file. It is the right
+last step before archiving an engagement directory, before sharing it, or before uninstalling
+blukit. It leaves any deny list alone: `set`, `add`, `remove` and `clear` all rewrite the scope
+value only, and the deny list changes only when `blukit run --deny` says so.
+
+`scope show` prints the deny list on a second line whenever one is recorded, so the two halves of the
+boundary are read back together:
+
+```console
+$ blukit scope show
+10.20.30.0/24
+deny: 10.20.30.7/32
+```
+
+When no deny list is recorded, or the recorded one is empty, only the scope is printed.
+
+When there is nothing to read, each fails loudly rather than printing nothing:
+
+```console
+$ blukit scope show
+blukit: no .mcp.json found
+$ echo $?
+1
+
+$ cd /tmp/with-a-foreign-config
+$ blukit scope show
+blukit: /tmp/with-a-foreign-config/.mcp.json declares no defense server
+$ echo $?
+1
+```
+
+Both accept `--mcp-json PATH` so you can inspect a project without `cd`-ing into it:
+
+```console
+$ blukit scope show --mcp-json /srv/engagements/globex/.mcp.json
+192.0.2.0/24
+```
+
+## Worked example: reading the launch log
+
+Every launch that happens appends one line to the local log, and nothing else writes to it. Two
+launches, one of which recorded the scope and one of which deliberately did not:
+
+```console
+$ blukit -s 10.20.30.0/24 -y
+blukit: scope 10.20.30.0/24 recorded in /srv/engagements/acme/.mcp.json
+blukit: authorized scope -> 10.20.30.0/24
+$ blukit -s 10.20.30.9 -y --no-write
+blukit: scope -> 10.20.30.9/32 (not written; --no-write)
+blukit: scope -> 10.20.30.9/32 (NOT enforced; recorded scope is unchanged)
+```
+
+`blukit log` prints them newest-first, and the two rows differ in the column that matters:
+
+```console
+$ blukit log
+2026-09-16T04:24:34Z  10.20.30.9/32  NOT enforced  /srv/engagements/acme/.mcp.json
+2026-09-16T04:24:33Z  10.20.30.0/24  enforced  /srv/engagements/acme/.mcp.json
+```
+
+Both launches are in the log. The `--no-write` one is marked `NOT enforced` because that flag left
+the `.mcp.json` `env` block in charge, so that session ran under `10.20.30.0/24` while the command
+line asked for `10.20.30.9`. That is what the column is for: the requested scope is recorded either
+way, and the flag says whether it was the one actually written to the file. A `-` in the last column
+is an entry with no `.mcp.json` at all, which is what `--allow-unscoped` records when there is no
+file to write to.
+
+`--json` prints the stored lines themselves, oldest first, which is the form to pipe into `jq`:
+
+```console
+$ blukit log --json
+{"v": 1, "at": "2026-09-16T04:24:33Z", "event": "launch", "scope": "10.20.30.0/24", "enforced": true, "mcp_json": "/srv/engagements/acme/.mcp.json", "cwd": "/srv/engagements/acme", "claude": "/home/you/.claude/bin/claude", "pid": 3892270}
+{"v": 1, "at": "2026-09-16T04:24:34Z", "event": "launch", "scope": "10.20.30.9/32", "enforced": false, "mcp_json": "/srv/engagements/acme/.mcp.json", "cwd": "/srv/engagements/acme", "claude": "/home/you/.claude/bin/claude", "pid": 3892292}
+```
+
+The file is `$XDG_STATE_HOME/blukit/launches.jsonl`, or `~/.local/state/blukit/launches.jsonl` by
+default, written `0600` inside a `0700` directory because it names client address ranges. `-n N`
+limits the output to the newest `N` entries and `0` means all of them, and `--path` reads a
+different file — a log you archived, for instance:
+
+```console
+$ blukit log -n 1
+2026-09-16T04:24:34Z  10.20.30.9/32  NOT enforced  /srv/engagements/acme/.mcp.json
+```
+
+A launch that never happened is not in there. A dry run, a scope the parser rejected, and a run that
+could not find the Claude Code CLI all log nothing, and with no log file yet the command is not an
+error:
+
+```console
+$ blukit log
+blukit: no launches recorded yet (/home/you/.local/state/blukit/launches.jsonl)
+$ echo $?
+0
+```
+
+## Worked example: watching the scope during a session
+
+The launcher writes the scope and hands over. For the rest of that session the boundary lives in a
+file, and `blukit watch` is what tells you if the file moves. Run it beside the session — a second
+terminal, a split pane, or another `tmux` window:
+
+```console
+$ blukit watch
+blukit watch                                                         15:03:59
+──────────────────────────────────────────────────────────────────────────────
+scope in force    10.20.30.0/24
+recorded in       /srv/engagements/acme/.mcp.json  (last changed 12m 41s ago)
+watching for      12m 44s
+──────────────────────────────────────────────────────────────────────────────
+ALERTS
+  nothing has changed since this pane started
+──────────────────────────────────────────────────────────────────────────────
+RECENT LAUNCHES
+  15:01:15  10.20.30.0/24  enforced
+──────────────────────────────────────────────────────────────────────────────
+Ctrl-C to stop. This pane only reports; it decides nothing.
+```
+
+Nothing here is privileged. In a second terminal, the same thing any process on the machine could
+do:
+
+```console
+$ blukit scope set 10.0.0.0/8
+blukit: scope 10.0.0.0/8 recorded in /srv/engagements/acme/.mcp.json
+```
+
+The pane notices on its next sample and says so in the terms that matter — the new scope authorises
+addresses the old one did not:
+
+```console
+ALERTS (1)
+  15:16:40  !!  the recorded scope changed under you: 10.20.30.0/24 ->
+                10.0.0.0/8 and it is wider than before
+```
+
+A narrowing is reported the same way, but as a note rather than an alarm, because nothing has been
+over-authorised:
+
+```console
+ALERTS (1)
+  15:18:02  --  the recorded scope changed under you: 10.0.0.0/8 -> 10.0.0.0/24
+```
+
+Three things raise an alarm: the scope value changing, the `defense` server disappearing or losing
+its scope key, and the file being deleted or becoming unreadable. A rewrite that leaves the scope
+byte-identical is a note, so saving the file in an editor is not an incident.
+
+Exit is `0` when the scope held throughout and `1` when any alarm was raised, which is what makes
+this usable in a script as well as on screen:
+
+```console
+$ blukit watch --once --no-color | grep -c "scope in force"
+1
+$ echo $?
+0
+```
+
+The pane reads the file; it does not police a running process. It cannot see which scope a tool
+server already loaded before the change, and it stops nothing — an alarm means a session started
+*from that moment* would be wider than the one you authorised, which is exactly the moment worth
+knowing about.
+
+## Worked example: the theme and the doctor command
+
+```console
+$ blukit theme status
+blukit: not installed (/home/you/.claude/themes)
+$ blukit theme install
+blukit: theme written to /home/you/.claude/themes/blukit.json
+blukit: set theme = "blukit" in your tui.toml to use it
+$ blukit theme status
+blukit: installed (/home/you/.claude/themes)
+```
+
+blukit only copies the file. Activating it is a one-line edit you make yourself, in
+`~/.claude/tui.toml`:
+
+```toml
+theme = "blukit"
+```
+
+With `BLUKIT_CLAUDE_HOME` set, both `theme install` and `theme status` use
+`$BLUKIT_CLAUDE_HOME/themes` instead, which is how you test the copy without touching a real Claude
+installation. Note that this variable only relocates the themes directory as far as blukit is
+concerned — the Claude Code CLI's own config still lives in its usual place, so a relocated themes
+directory is only useful if your CLI installation has been set up to match:
+
+```console
+$ BLUKIT_CLAUDE_HOME=/tmp/claude-test blukit theme install
+blukit: theme written to /tmp/claude-test/themes/blukit.json
+blukit: set theme = "blukit" in your tui.toml to use it
+```
+
+`--force` is for replacing a theme you have edited. Without it, an existing file is never
+overwritten: when it already matches the bundled theme the command still reports the theme as
+written and exits `0`, and when it differs the difference is reported on stderr, nothing is written,
+and the exit code is `1`:
+
+```console
+$ blukit theme install
+blukit: /home/you/.claude/themes/blukit.json already exists and differs from the bundled theme
+blukit: re-run with --force to overwrite it
+$ echo $?
+1
+$ blukit theme install --force
+blukit: theme written to /home/you/.claude/themes/blukit.json
+blukit: set theme = "blukit" in your tui.toml to use it
+```
+
+`install.sh` copies the file unconditionally, so it does overwrite a local edit.
+
+A destination that is a symlink is refused outright, with or without `--force`, so a link someone else
+placed there cannot redirect the write:
+
+```console
+$ blukit theme install
+blukit: /home/you/.claude/themes/blukit.json is a symlink; refusing to write through it
+$ echo $?
+1
+```
+
+Note that `theme status` only asks whether a file is present, so it still reports `installed` for a
+symlink that `theme install` will refuse.
+
+`doctor` is the single command to run when something is off:
+
+```console
+$ blukit doctor
+claude binary        : /home/you/.claude/bin/claude ok
+config file        : /home/you/.config/blukit/config.toml absent (defaults)
+mcp.json           : /srv/engagements/acme/.mcp.json
+recorded scope     : 10.20.30.0/24
+theme installed    : yes (/home/you/.claude/themes)
+audit log          : /home/you/.local/state/blukit/launches.jsonl (last launch 2026-09-16T04:24:34Z)
+```
+
+Read it as: the binary resolved, the state of the config file, the file blukit would write, the
+scope currently recorded, whether the theme file is present, and where the launch log is and how
+recent its newest entry is (`disabled` when `audit = false`). The `config file` line reads
+`ok` when the file loaded, `absent (defaults)` when there is no file, and
+`unreadable (using defaults)` when a file is there but could not be parsed. A `MISSING` binary or an
+unreadable scope makes it exit `1`, and the `audit log` line does not affect the exit code. Note that
+"no `.mcp.json` in this directory tree" does not make it exit `1`, so do not use `doctor` as a gate
+for that condition — use `blukit scope show`, which does fail.
+
+## Scope syntax reference
+
+A scope is a comma-separated list. Each entry may be:
+
+| Kind | Example | Normalised to |
+|---|---|---|
+| IPv4 address | `10.0.0.5` | `10.0.0.5/32` |
+| IPv4 network | `10.0.0.0/24` | `10.0.0.0/24` |
+| IPv6 address | `2001:db8::1` | `2001:db8::1/128` |
+| IPv6 network | `2001:db8::/32` | `2001:db8::/32` |
+| Hostname | `APP.Example.COM.` | `app.example.com` |
+
+Rules and limits:
+
+- Duplicates are removed; the order of the rest is preserved.
+- Entries are lowercased and a trailing dot is stripped, so `App.Example.COM.` and
+  `app.example.com` are the same entry.
+- An entry longer than 253 characters is rejected.
+- These characters are rejected anywhere in an entry: whitespace, `"`, `'`, `` ` ``, `$`, `;`, `&`,
+  `|`, `<`, `>`, `(`, `)`, `{`, `}`, `[`, `]`, `\`, `!`, `*`, `?`, `~`, `^`, `#`, and control
+  characters.
+- An entry made only of digits and dots has to be a valid IP address or network. `10.0.0.256`,
+  `999.1.1.1`, `192.168.1.300` and `1.2.3.4.5` are rejected rather than read as hostnames.
+- A network whose host bits are set is rejected, with the corrected form named in the message:
+  `10.0.0.5/24` used to be rounded down and is now an error. A bare address is unaffected:
+  `10.0.0.5` is still `10.0.0.5/32`.
+- A prefix length of `0` is refused unless `--allow-any` is passed, because `0.0.0.0/0` and `::/0`
+  authorise every address there is.
+- Wildcards are not supported at all, in any position: `*.example.com` is an error.
+- Legacy numeric address forms are refused: `0x7f000001`, `0x7f.1`, `127.1` and every other form
+  `inet_aton` accepts, because resolvers read them as a host you did not type — those three all mean
+  `127.0.0.1`.
+
+The whole scope value also has a set of shortcuts: `solo`, `none`, `off`, or an empty string mean
+`127.0.0.1/32`, in any case, with surrounding whitespace ignored. Those words are matched against
+the whole value only. Inside a list they are ordinary hostnames:
+
+```console
+$ blukit -s solo -n
+blukit: would record 127.0.0.1/32 in /srv/engagements/acme/.mcp.json
+blukit: would launch /home/you/.claude/bin/claude
+$ blukit -s '10.0.0.5,solo' -n
+blukit: would record 10.0.0.5/32,solo in /srv/engagements/acme/.mcp.json
+blukit: would launch /home/you/.claude/bin/claude
+```
+
+The same syntax, limits and refusals apply to `--deny`, so a denied target is written in exactly the
+form the same token would take as a scope entry. The one difference is the empty value: as a scope it
+means the `solo` loopback default, and as a deny list it means "deny nothing".
+
+Rejections look like this and exit `2`:
+
+```console
+$ blukit -s '*.example.com' -y -n
+blukit: '*.example.com' uses wildcard matching, which the tool server cannot enforce
+blukit: expected a comma-separated list of hosts, IPs or CIDRs, or 'solo'
+$ blukit -s 10.0.0.5/24 -n
+blukit: '10.0.0.5/24' has host bits set; did you mean 10.0.0.0/24?
+blukit: expected a comma-separated list of hosts, IPs or CIDRs, or 'solo'
+$ blukit -s 0.0.0.0/0 -n
+blukit: '0.0.0.0/0' covers every address; pass --allow-any to confirm that is intended
+blukit: expected a comma-separated list of hosts, IPs or CIDRs, or 'solo'
+$ blukit -s 0x7f000001 -n
+blukit: '0x7f000001' is a legacy numeric address form that resolvers read as a different host; write it as a dotted-quad address instead
+blukit: expected a comma-separated list of hosts, IPs or CIDRs, or 'solo'
+$ blukit -s 10.0.0.256 -n
+blukit: '10.0.0.256' looks like an IP address but is not valid
+blukit: expected a comma-separated list of hosts, IPs or CIDRs, or 'solo'
+```
+
+```console
+$ blukit -s 10.20.30.0/24 --deny '*.example.com' -n
+blukit: '*.example.com' uses wildcard matching, which the tool server cannot enforce
+blukit: expected a comma-separated list of hosts, IPs or CIDRs for the deny list
+$ echo $?
+2
+```
+
+The second line names the list that was rejected, so it is clear which of the two values was at
+fault. Nothing is written: both lists are validated before the file is touched.
+
+Mixing kinds in one scope is fine:
+
+```console
+$ blukit -s '10.0.0.5, APP.Example.COM., 2001:db8::/32' -n
+blukit: would record 10.0.0.5/32,app.example.com,2001:db8::/32 in /srv/engagements/acme/.mcp.json
+blukit: would launch /home/you/.claude/bin/claude
+```
+
+`--allow-any` exists so that a deliberate `0.0.0.0/0` is possible, not so that it is convenient:
+
+```console
+$ blukit -s 0.0.0.0/0 -n --allow-any
+blukit: would record 0.0.0.0/0 in /srv/engagements/acme/.mcp.json
+blukit: would launch /home/you/.claude/bin/claude
+```
+
+## What gets written to `.mcp.json`
+
+One value, plus the deny list when `--deny` asks for it:
+`mcpServers.defense.env.DEFENSE_ALLOWED_TARGETS`, and `mcpServers.defense.env.DEFENSE_DENIED_TARGETS`.
+Everything else in the file is read, re-serialised and written back unchanged. Concretely:
+
+- The file is found by walking up from the working directory, or taken from `--mcp-json`.
+- A file with no `mcpServers.defense` entry is not modified, and the run stops with `exit 1` because
+  the scope could not be recorded.
+- A `<name>.lock` sidecar beside the target is locked for the read-modify-write, so two runs against
+  the same project queue instead of interleaving. The lock file is created on the first write and
+  stays there, which is why `.mcp.json.lock` appears in this repository's `.gitignore`.
+- The new content is written to a staging file named `.mcp.json.<random>.new` and parsed back as JSON
+  before it is swapped in with `os.replace`, so a half-written `.mcp.json` is not a state this tool
+  can leave behind. The randomised name matters: with the old fixed name `.mcp.json.new`, a hostile
+  repository could have committed a symlink at that path and blukit would have written through it on
+  to any file the user could write.
+- The previous version is copied to `.mcp.json.<YYYYmmdd-HHMMSS>.bak` before the swap, so the target
+  is never briefly missing. Two writes inside the same second do not collide: the second takes `-1`,
+  the third `-2`, and so on.
+- The target keeps its file mode. A `.mcp.json` at `0600` is still `0600` after a write, rather than
+  being loosened to the umask on a file that may hold a `DEFENSE_TOKEN`.
+- Backups beyond `backup_keep` are deleted, oldest first, ordered by timestamp and then by that
+  suffix, so the ones kept are genuinely the newest. `backup_keep = 0` skips both the backup and the
+  pruning, so the swap is direct.
+- When both values already equal what was asked for, the file is not written and no backup is made.
+  A deny list that changed on its own is not that case: it is written and backed up like any other
+  change.
+- Input that cannot be parsed is reported as a message rather than a traceback: invalid UTF-8, invalid
+  JSON, and JSON nested too deeply all produce a clean error and the fail-closed exit.
+- The whole file is re-serialised with two-space indentation, so the first run after you hand-edit
+  the file usually shows a reformatting diff. Existing keys keep their order; a missing `env` object
+  is appended to the server entry.
+- Under `--dry-run` all of the checks above are evaluated and nothing is written, so the answers match
+  a real run, including the exit code. The one thing it does not do is create the staging file or take
+  the lock, which is why it cannot report that the directory is unwritable.
+
+The staging file, the backups and the lock are all written beside the target, which is why
+`.gitignore` has to cover any `*.mcp.json` basename and not just `.mcp.json`.
+
+## Recipes
+
+Configure a default scope for a machine that is only ever used against one lab range, so the prompt
+press-enter path is useful rather than a footgun:
+
+```toml
+# ~/.config/blukit/config.toml
+default_scope = "10.20.0.0/16"
+```
+
+Pin a specific CLI build, leaving the `PATH` lookup out of it:
+
+```toml
+claude_bin = "~/.local/bin/claude-1.2.3"
+```
+
+Turn a pivot flag on for every launch, in a project whose tool server reads the environment:
+
+```toml
+[extra_env]
+DEFENSE_ALLOW_PIVOT = "1"
+```
+
+An `[extra_env]` entry cannot set the scope. `DEFENSE_ALLOWED_TARGETS` is dropped from the table and
+reported as a config problem, because a config file must not be able to widen the scope behind a
+banner that names the requested one. A key that TOML cannot express bare — one with a space, a colon,
+or a dot — is written quoted, and control characters are escaped, so unusual keys and values survive
+being saved and read back.
+
+Scope a project you are not sitting in, and confirm it landed:
+
+```bash
+BLUKIT_CLAUDE_BIN=/bin/true \
+  blukit -s 10.20.30.0/24 --mcp-json /srv/engagements/acme/.mcp.json -y
+blukit scope show --mcp-json /srv/engagements/acme/.mcp.json
+```
+
+Reset a directory before handing it to someone else:
+
+```bash
+blukit scope clear
+rm -f .mcp.json.*.bak .mcp.json.lock
+```
+
+## Troubleshooting
+
+**`blukit: no .mcp.json found`** — `scope show` needs a file; the search walks up from the working
+directory. Either `cd` into the project or pass `--mcp-json`.
+
+**`blukit: <path> declares no 'defense' server; nothing to scope`** followed by **`nothing was
+launched: the scope could not be recorded`** — the file exists but has no `mcpServers.defense` entry,
+so there was nowhere to record the scope and blukit stopped rather than run under the scope already in
+the file. Compare the file against `examples/.mcp.json.example`. The same three-line failure appears
+for a missing `.mcp.json`, an unreadable file, and a write that failed.
+
+**`blukit: pass --allow-unscoped to launch anyway`** — that line is part of the failure above, and it
+is the only way past it. Before you use it, read the scope already in the file with `blukit scope
+show`: that is the scope the session will actually run under, and it may be wider than the one you
+asked for.
+
+**`blukit: cannot find the Claude Code CLI ('claude')`** — the binary is not on `PATH` and no path is
+configured. Set `claude_bin`, or export `BLUKIT_CLAUDE_BIN=/full/path/to/claude`.
+
+**`blukit: could not open <path>.lock: ...`** or **`could not stage a new .mcp.json: ...`** — the
+directory holding the target is not writable by you, so the scope could not be recorded and the run
+stopped. Fix the permissions on the directory. A dry run will not show you this, because it takes no
+lock and stages no file.
+
+**`blukit: could not read <file>: ...`**, **`unknown key 'x' ignored`**, or **`blukit: extra_env
+cannot set DEFENSE_ALLOWED_TARGETS; the authorised scope is the one that is recorded`** — the config
+file is malformed or has a setting blukit will not accept. Every setting falls back to its default and
+the run continues; a bad `default_scope` falls back to `127.0.0.1/32`, and an `[extra_env]` entry
+naming the scope is dropped. `blukit run` prints these warnings before it does anything else, and
+`blukit config show` and `blukit doctor` print the same lines; the exit code stays `0`, because a
+config problem is not a reason to refuse to launch. `blukit config path` tells you which file is
+being read, which matters when `BLUKIT_CONFIG` is set. `doctor` adds a state to its `config file`
+line — `ok`, `absent (defaults)` when no file exists, or `unreadable (using defaults)` when one exists
+but could not be parsed — so you can tell a missing config from a broken one.
+
+**`blukit: /path/.mcp.json already exists; leaving it alone`** (from `config init`) — expected;
+delete the file first if you want a fresh default written.
+
+**`blukit: /path/.mcp.json is not valid JSON: ...`** or **`... is not valid UTF-8: ...`** or
+**`... is nested too deeply to parse`** — blukit will not parse a file it cannot read, and will not
+write one either, so the run stops with `exit 1`. Fix the file by hand; the backups it made are valid
+JSON, so the newest `.bak` is usually the fastest way back.
+
+**The scope looks right in `.mcp.json` but the session still sees an old one** — check for a
+`--no-write` or `write_mcp_json = false` in play, and check for a nearer `.mcp.json` than the one
+you edited. Remember that the `.mcp.json` `env` block wins over the exported variable, so anything
+reading the file needs the file updated.
+
+**Everything looks right but the tool server still refuses targets** — blukit has no visibility
+into the tool server. It records one value; whether that value is what your server checks is outside
+what this launcher can verify.
+
+**A run in a script printed nothing** — check the exit code first: a run that never launched prints its
+reason on stderr and exits `1` or `2`. When it does launch, the status lines are flushed before the
+CLI takes over, so they do reach a pipe or a log file. This is the run's own output on the terminal,
+not the launch log: read that back with `blukit log`, and the scope recorded in `.mcp.json` with
+`blukit scope show`.
+
+**A dry run was happy but the real run refused to write** — `--dry-run` takes no lock and creates no
+staging file, so it cannot tell you the directory is read-only. The real run reports the lock or
+staging failure, says `nothing was launched: the scope could not be recorded`, and exits `1`. Fix the
+permissions on the directory, not the file.
+
+**`blukit theme install` refuses to touch my theme** — the installed file differs from the bundled
+one, which is what the command believes a local edit looks like. Re-run with `--force` if you want the
+bundled theme back, or leave it and keep your edit. If the destination is a symlink, the refusal is
+unconditional and `--force` will not change it; remove the link first if you really meant to replace
+it.

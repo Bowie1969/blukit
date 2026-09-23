@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "blukit"
+dynamic = ["version"]
+description = "Scope-gated launcher for the Claude Code CLI."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+keywords = ["claude", "cli", "launcher", "scope", "blue-team"]
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Bowie1969/blukit"
+Issues = "https://github.com/Bowie1969/blukit/issues"
+
+[project.scripts]
+blukit = "blukit.cli:main"
+
+[tool.hatch.version]
+path = "blukit/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["blukit"]
