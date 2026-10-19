@@ -27,9 +27,10 @@ Issues = "https://github.com/Bowie1969/blukit/issues"
 
 [project.scripts]
 blukit = "blukit.cli:main"
+defense-server = "defense.server:serve"
 
 [tool.hatch.version]
 path = "blukit/__init__.py"
 
 [tool.hatch.build.targets.wheel]
-packages = ["blukit"]
+packages = ["blukit", "defense"]

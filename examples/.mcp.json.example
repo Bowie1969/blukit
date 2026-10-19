@@ -2,7 +2,7 @@
   "mcpServers": {
     "defense": {
       "command": "python3",
-      "args": ["defense_server.py"],
+      "args": ["-m", "defense"],
       "env": {
         "DEFENSE_ALLOWED_TARGETS": "127.0.0.1/32",
         "DEFENSE_DENIED_TARGETS": "",
@@ -10,7 +10,10 @@
         "DEFENSE_ALLOW_RESPONSE": "0",
         "DEFENSE_ALLOW_INTERPRETER": "0",
         "DEFENSE_ALLOW_ANY_CMD": "0",
-        "DEFENSE_TOKEN": ""
+        "DEFENSE_TOKEN": "",
+        "DEFENSE_BACKEND": "subprocess",
+        "DEFENSE_SSH_USER": "root",
+        "DEFENSE_WIN_HOSTS": ""
       }
     }
   }
